@@ -112,7 +112,7 @@ def get_character_response(system_prompt, history, params):
         content = response.choices[0].message.content.strip()
         if content:
             return content
-    return "..."  # Fallback ellipsis for silence
+    return "I see."  # Neutral fallback line for rare silences
 
 def main():
     parser = argparse.ArgumentParser()
