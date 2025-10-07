@@ -235,7 +235,7 @@ def main():
 
         for i, line in enumerate(lines):
             line = line.strip()
-            if line.startswith('ACT ') and ('(Steps ' in line or '(Step ' in line):
+            if line.startswith('ACT ') and ('(Step' in line or '(Steps' in line):
                 # Extract step numbers from "ACT X (Steps 1-2)" or "ACT X (Step 3)"
                 import re
                 if '(Steps ' in line:
@@ -244,7 +244,7 @@ def main():
                         start_step = int(step_match.group(1))
                         end_step = int(step_match.group(2))
                         current_act_steps = list(range(start_step, end_step + 1))
-                else:
+                elif '(Step ' in line:
                     step_match = re.search(r'ACT \d+ \(Step (\d+)\)', line)
                     if step_match:
                         step_num = int(step_match.group(1))
@@ -257,11 +257,13 @@ def main():
                 # Check if CASTING is on the same line
                 if 'CASTING:' in line:
                     casting_part = line.split('CASTING:')[1].strip()
-                    # Remove any trailing content after the casting (like SCENE:)
-                    if '.' in casting_part:
+                    # Remove any trailing content after the casting (like . SCENE:)
+                    if 'SCENE:' in casting_part:
+                        casting_part = casting_part.split('SCENE:')[0].strip()
+                    elif '.' in casting_part:
                         casting_part = casting_part.split('.')[0].strip()
                     # Split by commas and clean up names
-                    cast_chars = [name.strip() for name in casting_part.split(',') if name.strip()]
+                    cast_chars = [name.strip().rstrip('.') for name in casting_part.split(',') if name.strip()]
                     # Add to all steps in current act
                     for step in current_act_steps:
                         casting_per_step[step] = cast_chars
@@ -287,18 +289,20 @@ def main():
 
             if not available_chars:
                 # No cast characters available, use first character but make them silent
-                available_chars = [characters[0]]
+                char = characters[0]
                 should_speak = False
             else:
+                # Select one character from the cast for this step
+                # Rotate through cast characters more frequently for better dialogue flow
+                char_idx = step % len(available_chars)
+                char = available_chars[char_idx]
                 should_speak = True
         else:
             # No casting info, fall back to cycling through all characters
-            available_chars = characters
+            char_idx = step % len(characters)
+            char = characters[char_idx]
             should_speak = True
 
-        # Cycle through available characters for this step
-        char_idx = step % len(available_chars)
-        char = available_chars[char_idx]
         name = char["name"]
         base_prompt = char["prompt"]
 
@@ -321,7 +325,21 @@ def main():
             print(f"Params: {params}")
 
         # Character response with enhanced retry logic
-        if should_speak and current_step in casting_info and name in casting_info[current_step]:
+        # Check if character is cast (allow partial name matching for first names)
+        is_cast = False
+        if current_step in casting_info:
+            cast_names = casting_info[current_step]
+            # Check for exact match first, then try first name matching
+            if name in cast_names:
+                is_cast = True
+            else:
+                # Try matching first names (e.g., "Romeo Montague" matches "Romeo")
+                first_name = name.split()[0] if name.split() else name
+                is_cast = any(first_name in cast_name for cast_name in cast_names)
+        if args.debug:
+            console.print(f"[dim cyan][DEBUG] Step {current_step}: {name} | should_speak: {should_speak} | in_casting: {is_cast} | cast_list: {casting_info.get(current_step, [])}[/dim cyan]")
+
+        if should_speak and is_cast:
             # Character is cast for this step, they should speak
             response = get_character_response(updated_prompt, history, params)
         else:
