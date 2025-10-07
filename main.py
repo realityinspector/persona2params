@@ -63,7 +63,7 @@ def get_architect_response(context):
             print(f"[DEBUG] No JSON found in architect response: {content}")
             raise ValueError("No valid JSON found in API response for architect")
 
-def get_scriptwriter_response(context, characters):
+def get_scriptwriter_response(context, characters, total_steps):
     # Create a summary of characters for the scriptwriter
     char_summary = "\n".join([f"- {char['name']}: {char['prompt']}" for char in characters])
 
@@ -71,7 +71,7 @@ def get_scriptwriter_response(context, characters):
         model=MODEL,
         messages=[
             {"role": "system", "content": PROMPTS["scriptwriter"]},
-            {"role": "user", "content": f"Context: {context}\n\nCharacters:\n{char_summary}"},
+            {"role": "user", "content": f"Context: {context}\nTotal conversation steps: {total_steps}\n\nCharacters:\n{char_summary}"},
         ],
         response_format={"type": "json_object"},
         temperature=0.7,
@@ -192,7 +192,7 @@ def main():
         print(f"- {char['name']}: {char['prompt']}")
 
     # Scriptwriter creates narrative outline
-    scriptwriter_json = get_scriptwriter_response(context, characters)
+    scriptwriter_json = get_scriptwriter_response(context, characters, n_steps)
     script = scriptwriter_json["script"]
     print(f"\nNarrative Script: {script}")
 
