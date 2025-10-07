@@ -59,13 +59,61 @@ def get_architect_response(context):
             print(f"[DEBUG] No JSON found in architect response: {content}")
             raise ValueError("No valid JSON found in API response for architect")
 
-def get_director_response(history, character_name, character_prompt):
+def get_scriptwriter_response(context, characters):
+    # Create a summary of characters for the scriptwriter
+    char_summary = "\n".join([f"- {char['name']}: {char['prompt']}" for char in characters])
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": PROMPTS["scriptwriter"]},
+            {"role": "user", "content": f"Context: {context}\n\nCharacters:\n{char_summary}"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.7,
+        max_tokens=600,
+    )
+
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        raise ValueError("Empty response from API for scriptwriter")
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Try to extract JSON from the response by finding the first { and last }
+        start_idx = content.find('{')
+        end_idx = content.rfind('}')
+
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_content = content[start_idx:end_idx + 1]
+            # Clean up control characters that might break JSON parsing
+            import re
+            json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
+            try:
+                return json.loads(json_content)
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] Failed to parse extracted JSON from scriptwriter: {json_content}")
+                raise e
+        else:
+            print(f"[DEBUG] No JSON found in scriptwriter response: {content}")
+            raise ValueError("No valid JSON found in API response for scriptwriter")
+
+def get_director_response(history, character_name, character_prompt, script, current_step, total_steps):
     current_history = "\n".join(history)
+
+    # Format the director prompt with script and step information
+    director_prompt = PROMPTS["director"].format(
+        script=script,
+        current_step=current_step,
+        total_steps=total_steps
+    )
+
     user_prompt = f"Conversation history:\n{current_history}\n\nNext character: {character_name}\nBase character prompt: {character_prompt}"
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": PROMPTS["director"]},
+            {"role": "system", "content": director_prompt},
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
@@ -136,6 +184,11 @@ def main():
     for char in characters:
         print(f"- {char['name']}: {char['prompt']}")
 
+    # Scriptwriter creates narrative outline
+    scriptwriter_json = get_scriptwriter_response(context, characters)
+    script = scriptwriter_json["script"]
+    print(f"\nNarrative Script: {script}")
+
     history = [f"Setting: {setting}"]  # Initial history
     dialog = []
     director_outputs = []  # Collect Director outputs for report
@@ -148,7 +201,7 @@ def main():
         base_prompt = char["prompt"]
 
         # Director step
-        director_json = get_director_response(history, name, base_prompt)
+        director_json = get_director_response(history, name, base_prompt, script, step + 1, n_steps)
         updated_prompt = director_json["updated_prompt"]
         params = director_json["params"]
 
@@ -198,6 +251,8 @@ def main():
     with open(report_path, "w") as f:
         f.write("# Dialog Report\n\n")
         f.write(f"**Timestamp:** {timestamp}\n\n")
+        f.write(f"**Context:** {context}\n\n")
+        f.write(f"**Narrative Script:** {script}\n\n")
         f.write("## Dialog\n\n")
         f.write("\n".join(dialog))
         f.write("\n\n## Prompts\n\n")
