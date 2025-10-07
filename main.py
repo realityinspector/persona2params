@@ -5,6 +5,9 @@ import datetime
 import argparse
 from dotenv import load_dotenv
 from openai import OpenAI
+from rich.console import Console
+from rich.text import Text
+from rich.panel import Panel
 
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -18,9 +21,34 @@ client = OpenAI(
 
 MODEL = "openai/gpt-4o"  # Stricter adherence than Claude for roleplaying
 
+# Initialize Rich console for styled output
+console = Console()
+
+# Character color mapping (cycling through distinct colors)
+CHARACTER_COLORS = [
+    "bright_cyan", "bright_green", "bright_yellow", "bright_magenta",
+    "bright_red", "bright_blue", "cyan", "green", "yellow", "magenta"
+]
+
 # Load prompts from prompts.json
 with open("prompts.json", "r") as f:
     PROMPTS = json.load(f)
+
+def get_character_color(character_name, characters):
+    """Get a unique color for each character"""
+    char_names = [char['name'] for char in characters]
+    try:
+        index = char_names.index(character_name)
+        return CHARACTER_COLORS[index % len(CHARACTER_COLORS)]
+    except ValueError:
+        return "white"  # fallback
+
+def print_styled_dialog(character_name, dialog_text, characters):
+    """Print styled dialog with colored character names"""
+    color = get_character_color(character_name, characters)
+    char_text = Text(f"{character_name}:", style=f"bold {color}")
+    dialog_text_obj = Text(f" {dialog_text}", style="white")
+    console.print(char_text, dialog_text_obj)
 
 def get_architect_response(context):
     response = client.chat.completions.create(
@@ -186,15 +214,62 @@ def main():
     if len(characters) > 5:
         characters = characters[:5]
 
-    print(f"Setting: {setting}")
-    print("Characters:")
+    console.print(f"[bold blue]Setting:[/bold blue] {setting}")
+    console.print("[bold blue]Characters:[/bold blue]")
     for char in characters:
-        print(f"- {char['name']}: {char['prompt']}")
+        color = get_character_color(char['name'], characters)
+        console.print(f"  • [{color}]{char['name']}[/{color}]: {char['prompt']}")
 
     # Scriptwriter creates narrative outline
     scriptwriter_json = get_scriptwriter_response(context, characters, n_steps)
     script = scriptwriter_json["script"]
-    print(f"\nNarrative Script: {script}")
+    console.print(f"\n[bold green]Narrative Script:[/bold green]")
+    console.print(Panel(script, border_style="green"))
+
+    # Parse casting information from script
+    def parse_casting(script_text):
+        """Parse casting information from script to determine which characters participate in each step"""
+        casting_per_step = {}
+        lines = script_text.split('\n')
+        current_act_steps = []
+
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line.startswith('ACT ') and ('(Steps ' in line or '(Step ' in line):
+                # Extract step numbers from "ACT X (Steps 1-2)" or "ACT X (Step 3)"
+                import re
+                if '(Steps ' in line:
+                    step_match = re.search(r'ACT \d+ \(Steps (\d+)-(\d+)\)', line)
+                    if step_match:
+                        start_step = int(step_match.group(1))
+                        end_step = int(step_match.group(2))
+                        current_act_steps = list(range(start_step, end_step + 1))
+                else:
+                    step_match = re.search(r'ACT \d+ \(Step (\d+)\)', line)
+                    if step_match:
+                        step_num = int(step_match.group(1))
+                        current_act_steps = [step_num]
+
+                # Initialize casting for these steps
+                for step in current_act_steps:
+                    casting_per_step[step] = []
+
+                # Check if CASTING is on the same line
+                if 'CASTING:' in line:
+                    casting_part = line.split('CASTING:')[1].strip()
+                    # Remove any trailing content after the casting (like SCENE:)
+                    if '.' in casting_part:
+                        casting_part = casting_part.split('.')[0].strip()
+                    # Split by commas and clean up names
+                    cast_chars = [name.strip() for name in casting_part.split(',') if name.strip()]
+                    # Add to all steps in current act
+                    for step in current_act_steps:
+                        casting_per_step[step] = cast_chars
+
+        return casting_per_step
+
+    casting_info = parse_casting(script)
+    console.print(f"[dim]Casting parsed: {casting_info}[/dim]")
 
     history = [f"Setting: {setting}"]  # Initial history
     dialog = []
@@ -202,8 +277,28 @@ def main():
     debug_infos = []  # Collect detailed debug info per step
 
     for step in range(n_steps):
-        char_idx = step % len(characters)
-        char = characters[char_idx]
+        current_step = step + 1
+
+        # Check if this step has specific casting
+        if current_step in casting_info and casting_info[current_step]:
+            # Only use characters that are cast for this step
+            cast_names = casting_info[current_step]
+            available_chars = [char for char in characters if char['name'] in cast_names]
+
+            if not available_chars:
+                # No cast characters available, use first character but make them silent
+                available_chars = [characters[0]]
+                should_speak = False
+            else:
+                should_speak = True
+        else:
+            # No casting info, fall back to cycling through all characters
+            available_chars = characters
+            should_speak = True
+
+        # Cycle through available characters for this step
+        char_idx = step % len(available_chars)
+        char = available_chars[char_idx]
         name = char["name"]
         base_prompt = char["prompt"]
 
@@ -226,12 +321,18 @@ def main():
             print(f"Params: {params}")
 
         # Character response with enhanced retry logic
-        response = get_character_response(updated_prompt, history, params)
+        if should_speak and current_step in casting_info and name in casting_info[current_step]:
+            # Character is cast for this step, they should speak
+            response = get_character_response(updated_prompt, history, params)
+        else:
+            # Character is not cast for this step, they remain silent
+            response = "..."
 
-        # Post-process response to strip actions and prefixes
-        import re
-        response = re.sub(r'\*.*?\*', '', response)  # Strip *actions*
-        response = re.sub(r'^.*?:', '', response).strip()  # Strip any "Name:" prefixes
+        # Post-process response to strip actions and prefixes (only if they spoke)
+        if response != "...":
+            import re
+            response = re.sub(r'\*.*?\*', '', response)  # Strip *actions*
+            response = re.sub(r'^.*?:', '', response).strip()  # Strip any "Name:" prefixes
 
         full_line = f"{name}: {response}"
         dialog.append(full_line)
@@ -247,10 +348,10 @@ def main():
         })
 
         if args.debug:
-            print(f"[DEBUG] Character Prompt: {updated_prompt + '\n' + PROMPTS['roleplayer_suffix']}")
-            print(f"[DEBUG] Response: {response}")
+            console.print(f"[dim cyan][DEBUG] Character Prompt: {updated_prompt + '\n' + PROMPTS['roleplayer_suffix']}[/dim cyan]")
+            console.print(f"[dim cyan][DEBUG] Response: {response}[/dim cyan]")
         else:
-            print(full_line)
+            print_styled_dialog(name, response, characters)
 
     # Generate report
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -285,7 +386,7 @@ def main():
             f.write(f"- **Character Prompt:** {debug_info['character_prompt']}\n")
             f.write(f"- **Raw Response:** {debug_info['raw_response']}\n\n")
 
-    print(f"\nReport saved to: {report_path}")
+    console.print(f"\n[bold yellow]Report saved to: {report_path}[/bold yellow]")
 
 if __name__ == "__main__":
     main()
