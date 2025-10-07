@@ -454,11 +454,14 @@ def main():
         lines = script_text.split('\n')
         current_act_steps = []
 
+        if args.debug:
+            console.print(f"[dim cyan]DEBUG: Parsing {len(lines)} script lines[/dim cyan]")
+
         i = 0
         while i < len(lines):
             line = lines[i].strip()
             if line.startswith('ACT ') and ('(Step' in line or '(Steps' in line):
-                # Extract step numbers from "ACT X (Steps 1-2)" or "ACT X (Step 3)"
+                # Extract step numbers from "ACT X (Step 1)" or "ACT X (Steps 1-2)"
                 import re
                 if '(Steps ' in line:
                     step_match = re.search(r'ACT \d+ \(Steps (\d+)-(\d+)\)', line)
@@ -472,26 +475,29 @@ def main():
                         step_num = int(step_match.group(1))
                         current_act_steps = [step_num]
 
+                if args.debug:
+                    console.print(f"[dim cyan]Found ACT with steps: {current_act_steps}[/dim cyan]")
+
                 # Initialize casting for these steps
                 for step in current_act_steps:
                     casting_per_step[step] = []
 
-                # Look for CASTING in the next few lines
-                j = i + 1
-                while j < len(lines) and not lines[j].strip().startswith('ACT '):
-                    cast_line = lines[j].strip()
-                    if cast_line.startswith('CASTING:'):
-                        casting_part = cast_line.split('CASTING:')[1].strip()
-                        # Remove any trailing content after the casting
-                        if '.' in casting_part:
-                            casting_part = casting_part.split('.')[0].strip()
-                        # Split by commas and clean up names
-                        cast_chars = [name.strip() for name in casting_part.split(',') if name.strip()]
-                        # Add to all steps in current act
-                        for step in current_act_steps:
-                            casting_per_step[step] = cast_chars
-                        break
-                    j += 1
+                # Check for inline CASTING in the ACT line
+                if 'CASTING:' in line:
+                    casting_part = line.split('CASTING:')[1].strip()
+                    # Remove any trailing content (like "SCENE:")
+                    if 'SCENE:' in casting_part:
+                        casting_part = casting_part.split('SCENE:')[0].strip()
+                    elif '.' in casting_part:
+                        casting_part = casting_part.split('.')[0].strip()
+                    # Split by commas and clean up names
+                    cast_chars = [name.strip().rstrip('.') for name in casting_part.split(',') if name.strip()]
+                    # Add to all steps in current act
+                    for step in current_act_steps:
+                        casting_per_step[step] = cast_chars
+
+                    if args.debug:
+                        console.print(f"[dim cyan]Parsed casting for steps {current_act_steps}: {cast_chars}[/dim cyan]")
 
             i += 1
 
@@ -499,6 +505,13 @@ def main():
 
     casting_info = parse_casting(script)
     console.print(f"[dim]Casting parsed: {casting_info}[/dim]")
+
+    # Debug: show script lines for casting parsing
+    if args.debug:
+        console.print(f"[dim yellow]Script lines for debugging:[/dim yellow]")
+        for i, line in enumerate(script.split('\n')[:20]):  # First 20 lines
+            if 'CASTING' in line or line.strip().startswith('ACT '):
+                console.print(f"[dim yellow]{i}: {line.strip()}[/dim yellow]")
 
     history = [f"Setting: {setting}"]  # Initial history
     dialog = []
@@ -558,6 +571,9 @@ def main():
     for step in range(n_steps):
         current_step = step + 1
 
+        # Determine current pattern for this step
+        current_pattern = get_current_pattern_for_step(current_step, script)
+
         # Check if this step has specific casting
         if current_step in casting_info and casting_info[current_step]:
             # Only use characters that are cast for this step
@@ -569,10 +585,21 @@ def main():
                 char = characters[0]
                 should_speak = False
             else:
-                # Select one character from the cast for this step
-                # Rotate through cast characters more frequently for better dialogue flow
-                char_idx = step % len(available_chars)
-                char = available_chars[char_idx]
+                # Select one character to speak per step, with pattern-aware rotation
+                pattern_turn = pattern_tracker.get(current_pattern, 0)
+
+                if current_pattern == 'CONFESSION' and 'Hermia' in cast_names:
+                    # For CONFESSION pattern, Hermia should speak first (the confessor)
+                    if pattern_turn == 0:
+                        char = next(char for char in available_chars if char['name'] == 'Hermia')
+                    else:
+                        # Then alternate between confessor and supporter
+                        char_idx = pattern_turn % len(available_chars)
+                        char = available_chars[char_idx]
+                else:
+                    # Default rotation through cast
+                    char_idx = pattern_turn % len(available_chars)
+                    char = available_chars[char_idx]
                 should_speak = True
         else:
             # No casting info, fall back to cycling through all characters
