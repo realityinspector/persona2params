@@ -4,8 +4,10 @@ import json
 import datetime
 import argparse
 import statistics
+import time
+import re
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIError, RateLimitError, Timeout
 from rich.console import Console, Group
 from rich.text import Text
 from rich.panel import Panel
@@ -35,6 +37,105 @@ CHARACTER_COLORS = [
 # Load prompts from prompts.json
 with open("prompts.json", "r") as f:
     PROMPTS = json.load(f)
+
+def robust_llm_call(messages, response_format=None, temperature=0.7, max_tokens=500,
+                    max_retries=3, fallback_response=None):
+    """Robust LLM call with retry logic, error handling, and JSON parsing."""
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            # Add error context for retries
+            if attempt > 0 and last_error:
+                error_context = f"\n\nPrevious attempt failed with: {str(last_error)[:100]}... Please ensure valid JSON format."
+                if isinstance(messages[-1]["content"], str):
+                    messages[-1]["content"] += error_context
+
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                response_format=response_format,
+                temperature=min(temperature + attempt * 0.1, 1.0),  # Slightly increase temperature on retries
+                max_tokens=max_tokens,
+                timeout=30
+            )
+
+            content = response.choices[0].message.content
+            if not content or not content.strip():
+                last_error = "Empty response from API"
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                return fallback_response or {"error": "Empty response after retries"}
+
+            # Try to parse JSON if expected
+            if response_format and response_format.get("type") == "json_object":
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    # Attempt to extract and clean JSON
+                    json_content = extract_json_from_response(content)
+                    if json_content:
+                        try:
+                            return json.loads(json_content)
+                        except json.JSONDecodeError:
+                            pass
+
+                    last_error = "JSON parsing failed"
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return fallback_response or {"error": "JSON parsing failed after retries", "raw_content": content[:500]}
+
+            return content
+
+        except (APIError, RateLimitError, Timeout) as e:
+            last_error = f"API Error: {str(e)}"
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                console.print(f"[dim yellow]API error, retrying in {wait_time}s...[/dim yellow]")
+                time.sleep(wait_time)
+                continue
+            return fallback_response or {"error": f"API error after retries: {str(e)}"}
+
+        except Exception as e:
+            last_error = f"Unexpected error: {str(e)}"
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return fallback_response or {"error": f"Unexpected error after retries: {str(e)}"}
+
+    return fallback_response or {"error": "All retry attempts failed"}
+
+def extract_json_from_response(content):
+    """Extract JSON from potentially malformed LLM response."""
+    # Remove markdown code blocks
+    content = re.sub(r'```json\s*', '', content)
+    content = re.sub(r'```\s*$', '', content)
+
+    # Find JSON boundaries
+    start_idx = content.find('{')
+    end_idx = content.rfind('}')
+
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return None
+
+    json_content = content[start_idx:end_idx + 1]
+
+    # Clean up common issues
+    json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)  # Remove control chars
+    json_content = re.sub(r',\s*}', '}', json_content)  # Remove trailing commas
+    json_content = re.sub(r',\s*]', ']', json_content)
+
+    # Try to balance braces
+    open_braces = json_content.count('{')
+    close_braces = json_content.count('}')
+    if open_braces > close_braces:
+        json_content += '}' * (open_braces - close_braces)
+    elif close_braces > open_braces:
+        json_content = '{' * (close_braces - open_braces) + json_content
+
+    return json_content
 
 def get_character_color(character_name, characters):
     """Get a unique color for each character"""
@@ -208,8 +309,16 @@ def analyze_param_diversity(param_history):
         return Panel(table, title="🔬 Parameter Diversity Metrics", border_style="blue")
 
 def get_architect_response(context):
-    response = client.chat.completions.create(
-        model=MODEL,
+    """Get architect response with robust error handling."""
+    fallback = {
+        "setting": "A generic setting based on the context",
+        "characters": [
+            {"name": "Character 1", "prompt": "A character in this scenario"},
+            {"name": "Character 2", "prompt": "Another character in this scenario"}
+        ]
+    }
+
+    result = robust_llm_call(
         messages=[
             {"role": "system", "content": PROMPTS["architect"]},
             {"role": "user", "content": f"Context: {context}"},
@@ -217,43 +326,24 @@ def get_architect_response(context):
         response_format={"type": "json_object"},
         temperature=0.7,
         max_tokens=500,
+        fallback_response=fallback
     )
 
-    content = response.choices[0].message.content
-    if not content or not content.strip():
-        raise ValueError("Empty response from API for architect")
+    if isinstance(result, dict) and "error" in result:
+        console.print(f"[dim yellow]Architect fallback used: {result['error']}[/dim yellow]")
+        return fallback
 
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        # Try to extract JSON from the response by finding the first { and last }
-        start_idx = content.find('{')
-        end_idx = content.rfind('}')
-
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_content = content[start_idx:end_idx + 1]
-            # Clean up characters that might break JSON parsing
-            import re
-            # Remove control characters
-            json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
-            # Escape single quotes within string values (but not structural quotes)
-            # This is a simple approach - replace single quotes with escaped versions
-            json_content = json_content.replace("'", "\\'")
-            try:
-                return json.loads(json_content)
-            except json.JSONDecodeError as e:
-                print(f"[DEBUG] Failed to parse extracted JSON from architect: {json_content[:500]}...")
-                raise e
-        else:
-            print(f"[DEBUG] No JSON found in architect response: {content}")
-            raise ValueError("No valid JSON found in API response for architect")
+    return result
 
 def get_scriptwriter_response(context, characters, total_steps):
-    # Create a summary of characters for the scriptwriter
+    """Get scriptwriter response with robust error handling."""
     char_summary = "\n".join([f"- {char['name']}: {char['prompt']}" for char in characters])
 
-    response = client.chat.completions.create(
-        model=MODEL,
+    fallback = {
+        "script": f"ACT 1 (Steps 1-{total_steps//2}): Introduction and setup of the scenario.\n\nACT 2 (Steps {total_steps//2 + 1}-{total_steps}): Development and resolution of the narrative."
+    }
+
+    result = robust_llm_call(
         messages=[
             {"role": "system", "content": PROMPTS["scriptwriter"]},
             {"role": "user", "content": f"Context: {context}\nTotal conversation steps: {total_steps}\n\nCharacters:\n{char_summary}"},
@@ -261,49 +351,34 @@ def get_scriptwriter_response(context, characters, total_steps):
         response_format={"type": "json_object"},
         temperature=0.7,
         max_tokens=600,
+        fallback_response=fallback
     )
 
-    content = response.choices[0].message.content
-    if not content or not content.strip():
-        raise ValueError("Empty response from API for scriptwriter")
+    if isinstance(result, dict) and "error" in result:
+        console.print(f"[dim yellow]Scriptwriter fallback used: {result['error']}[/dim yellow]")
+        return fallback
 
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        # Try to extract JSON from the response by finding the first { and last }
-        start_idx = content.find('{')
-        end_idx = content.rfind('}')
+    return result
 
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_content = content[start_idx:end_idx + 1]
-            # Clean up characters that might break JSON parsing
-            import re
-            # Remove control characters
-            json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
-            # Escape single quotes within string values
-            json_content = json_content.replace("'", "\\'")
-            try:
-                return json.loads(json_content)
-            except json.JSONDecodeError as e:
-                print(f"[DEBUG] Failed to parse extracted JSON from scriptwriter: {json_content[:500]}...")
-                raise e
-        else:
-            print(f"[DEBUG] No JSON found in scriptwriter response: {content}")
-            raise ValueError("No valid JSON found in API response for scriptwriter")
-
-def get_director_response(history, character_name, character_prompt, script, current_step, total_steps):
+def get_director_response(history, character_name, character_prompt, script, current_step, total_steps, current_pattern, pattern_position):
+    """Get director response with robust error handling."""
     current_history = "\n".join(history)
-
-    # Format the director prompt with script and step information
     director_prompt = PROMPTS["director"].format(
         script=script,
         current_step=current_step,
         total_steps=total_steps
     )
 
-    user_prompt = f"Conversation history:\n{current_history}\n\nNext character: {character_name}\nBase character prompt: {character_prompt}"
-    response = client.chat.completions.create(
-        model=MODEL,
+    user_prompt = f"Conversation history:\n{current_history}\n\nNext character: {character_name}\nBase character prompt: {character_prompt}\n\nCURRENT PATTERN: {current_pattern} | POSITION: {pattern_position}"
+
+    fallback = {
+        "pattern": current_pattern,
+        "pattern_position": pattern_position,
+        "updated_prompt": f"{character_name} continues the conversation naturally based on their personality and the current scene.",
+        "params": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 150}
+    }
+
+    result = robust_llm_call(
         messages=[
             {"role": "system", "content": director_prompt},
             {"role": "user", "content": user_prompt},
@@ -311,48 +386,37 @@ def get_director_response(history, character_name, character_prompt, script, cur
         response_format={"type": "json_object"},
         temperature=0.8,
         max_tokens=300,
+        fallback_response=fallback
     )
 
-    content = response.choices[0].message.content
-    if not content or not content.strip():
-        raise ValueError(f"Empty response from API for character {character_name}")
+    if isinstance(result, dict) and "error" in result:
+        console.print(f"[dim yellow]Director fallback used for {character_name}: {result['error']}[/dim yellow]")
+        return fallback
 
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        # Try to extract JSON from the response by finding the first { and last }
-        start_idx = content.find('{')
-        end_idx = content.rfind('}')
-
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_content = content[start_idx:end_idx + 1]
-            # Clean up control characters that might break JSON parsing
-            import re
-            json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
-            try:
-                return json.loads(json_content)
-            except json.JSONDecodeError as e:
-                print(f"[DEBUG] Failed to parse extracted JSON for {character_name}: {json_content}")
-                raise e
-        else:
-            print(f"[DEBUG] No JSON found in response for {character_name}: {content}")
-            raise ValueError(f"No valid JSON found in API response for character {character_name}")
+    return result
 
 def get_character_response(system_prompt, history, params):
+    """Get character response with robust error handling."""
     messages = [{"role": "system", "content": system_prompt + "\n" + PROMPTS["roleplayer_suffix"]}]
     messages.extend([{"role": "assistant" if i % 2 == 0 else "user", "content": msg} for i, msg in enumerate(history)])
-    for attempt in range(3):  # Retry up to 3 times
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=params.get("temperature", 0.7),
-            top_p=params.get("top_p", 1.0),
-            max_tokens=params.get("max_tokens", 150) + (attempt * 100),
-        )
-        content = response.choices[0].message.content.strip()
-        if content:
-            return content
-    return "I see."  # Neutral fallback line for rare silences
+
+    # Increase max_tokens on retries for potentially stuck responses
+    base_max_tokens = params.get("max_tokens", 150)
+
+    result = robust_llm_call(
+        messages=messages,
+        response_format=None,  # Not expecting JSON for character responses
+        temperature=params.get("temperature", 0.7),
+        max_tokens=base_max_tokens,
+        max_retries=3,
+        fallback_response="I see."  # Neutral fallback line
+    )
+
+    if isinstance(result, dict) and "error" in result:
+        console.print(f"[dim yellow]Character response fallback used: {result['error']}[/dim yellow]")
+        return "I see."
+
+    return result.strip() if result else "I see."
 
 def main():
     parser = argparse.ArgumentParser()
@@ -436,6 +500,55 @@ def main():
     debug_infos = []  # Collect detailed debug info per step
     param_history = []  # Collect parameter values for analysis
 
+    # Track pattern state across conversation
+    pattern_tracker = {}  # Track turn counts for each pattern type
+
+    def get_current_pattern_for_step(step_num, script_text):
+        """Determine which pattern should be used for the current step based on script."""
+        lines = script_text.split('\n')
+        current_act_pattern = None
+
+        # Find the act that contains this step and its pattern
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Check if this is an ACT line that contains our step
+            if line.startswith('ACT ') and ('(Steps ' in line or '(Step ' in line):
+                act_contains_step = False
+
+                if '(Steps ' in line:
+                    import re
+                    step_match = re.search(r'ACT \d+ \(Steps (\d+)-(\d+)\)', line)
+                    if step_match:
+                        start_step = int(step_match.group(1))
+                        end_step = int(step_match.group(2))
+                        if start_step <= step_num <= end_step:
+                            act_contains_step = True
+                elif '(Step ' in line:
+                    step_match = re.search(r'ACT \d+ \(Step (\d+)\)', line)
+                    if step_match and int(step_match.group(1)) == step_num:
+                        act_contains_step = True
+
+                # If this act contains our step, find its pattern
+                if act_contains_step:
+                    # Look for PATTERN in subsequent lines of this act
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip().startswith('ACT '):
+                        pattern_line = lines[j].strip()
+                        if 'PATTERN:' in pattern_line:
+                            # Extract pattern from line like "PATTERN: ARGUMENT→CONFESSION."
+                            pattern_part = pattern_line.split('PATTERN:')[1].strip()
+                            if '.' in pattern_part:
+                                pattern_part = pattern_part.split('.')[0].strip()
+                            return pattern_part
+                        j += 1
+                    break
+
+            i += 1
+
+        return "GENERAL"  # fallback
+
     for step in range(n_steps):
         current_step = step + 1
 
@@ -464,8 +577,19 @@ def main():
         name = char["name"]
         base_prompt = char["prompt"]
 
+        # Determine current pattern for this step
+        current_pattern = get_current_pattern_for_step(current_step, script)
+
+        # Track pattern position
+        if current_pattern not in pattern_tracker:
+            pattern_tracker[current_pattern] = 0
+        pattern_tracker[current_pattern] += 1
+        pattern_position = f"Turn {pattern_tracker[current_pattern]}"
+
         # Director step
-        director_json = get_director_response(history, name, base_prompt, script, step + 1, n_steps)
+        director_json = get_director_response(history, name, base_prompt, script, step + 1, n_steps, current_pattern, pattern_position)
+        pattern = director_json.get("pattern", "GENERAL")
+        pattern_position = director_json.get("pattern_position", "Turn 1")
         updated_prompt = director_json["updated_prompt"]
         params = director_json["params"]
 
@@ -473,6 +597,8 @@ def main():
         param_history.append({
             "step": step + 1,
             "character": name,
+            "pattern": pattern,
+            "pattern_position": pattern_position,
             "temperature": params.get("temperature", 0.7),
             "top_p": params.get("top_p", 1.0),
             "max_tokens": params.get("max_tokens", 150)
@@ -482,14 +608,17 @@ def main():
         director_outputs.append({
             "step": step + 1,
             "character": name,
+            "pattern": pattern,
+            "pattern_position": pattern_position,
             "updated_prompt": updated_prompt,
             "params": params
         })
 
         if args.debug:
-            print(f"\n[DEBUG] Director for {name}:")
-            print(f"Updated Prompt: {updated_prompt}")
-            print(f"Params: {params}")
+            console.print(f"\n[bold cyan][DEBUG] Director for {name}:[/bold cyan]")
+            console.print(f"[cyan]Pattern: {pattern} | Position: {pattern_position}[/cyan]")
+            console.print(f"[cyan]Updated Prompt: {updated_prompt}[/cyan]")
+            console.print(f"[cyan]Params: {params}[/cyan]")
 
         # Character response with enhanced retry logic
         # Check if character is cast (allow partial name matching for first names)
@@ -561,6 +690,7 @@ def main():
         f.write("### Director Outputs\n")
         for director_output in director_outputs:
             f.write(f"**Step {director_output['step']} - {director_output['character']}:**\n")
+            f.write(f"- **Pattern:** {director_output['pattern']} | **Position:** {director_output['pattern_position']}\n")
             f.write(f"- **Updated Prompt:** {director_output['updated_prompt']}\n")
             f.write(f"- **Params:** {director_output['params']}\n\n")
 
