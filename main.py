@@ -3,11 +3,13 @@ import os
 import json
 import datetime
 import argparse
+import statistics
 from dotenv import load_dotenv
 from openai import OpenAI
-from rich.console import Console
+from rich.console import Console, Group
 from rich.text import Text
 from rich.panel import Panel
+from rich.table import Table
 
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -49,6 +51,161 @@ def print_styled_dialog(character_name, dialog_text, characters):
     char_text = Text(f"{character_name}:", style=f"bold {color}")
     dialog_text_obj = Text(f" {dialog_text}", style="white")
     console.print(char_text, dialog_text_obj)
+
+def analyze_param_diversity(param_history):
+    """Analyze parameter diversity and variation across the conversation"""
+    if not param_history:
+        return "No parameter data to analyze."
+
+    # Extract parameter values
+    temperatures = [p["temperature"] for p in param_history]
+    top_ps = [p["top_p"] for p in param_history]
+    max_tokens_list = [p["max_tokens"] for p in param_history]
+
+    # Calculate statistics for each parameter
+    def analyze_param(values, param_name):
+        if not values:
+            return {}
+
+        mean_val = statistics.mean(values)
+        median_val = statistics.median(values)
+        stdev_val = statistics.stdev(values) if len(values) > 1 else 0
+        min_val = min(values)
+        max_val = max(values)
+        range_val = max_val - min_val
+
+        # Calculate coefficient of variation (stdev/mean) as percentage
+        cv_percent = (stdev_val / mean_val * 100) if mean_val != 0 else 0
+
+        # Count values in different ranges
+        if param_name == "temperature":
+            ranges = {"<0.5": 0, "0.5-0.8": 0, "0.8-1.0": 0, "1.0-1.2": 0, ">1.2": 0}
+            for v in values:
+                if v < 0.5: ranges["<0.5"] += 1
+                elif v < 0.8: ranges["0.5-0.8"] += 1
+                elif v < 1.0: ranges["0.8-1.0"] += 1
+                elif v < 1.2: ranges["1.0-1.2"] += 1
+                else: ranges[">1.2"] += 1
+        elif param_name == "top_p":
+            ranges = {"<0.5": 0, "0.5-0.8": 0, "0.8-0.95": 0, "0.95-1.0": 0, ">1.0": 0}
+            for v in values:
+                if v < 0.5: ranges["<0.5"] += 1
+                elif v < 0.8: ranges["0.5-0.8"] += 1
+                elif v < 0.95: ranges["0.8-0.95"] += 1
+                elif v <= 1.0: ranges["0.95-1.0"] += 1
+                else: ranges[">1.0"] += 1
+        else:  # max_tokens
+            ranges = {"<100": 0, "100-150": 0, "150-200": 0, "200-300": 0, ">300": 0}
+            for v in values:
+                if v < 100: ranges["<100"] += 1
+                elif v <= 150: ranges["100-150"] += 1
+                elif v <= 200: ranges["150-200"] += 1
+                elif v <= 300: ranges["200-300"] += 1
+                else: ranges[">300"] += 1
+
+        return {
+            "mean": round(mean_val, 3),
+            "median": round(median_val, 3),
+            "stdev": round(stdev_val, 3),
+            "cv_percent": round(cv_percent, 1),
+            "min": min_val,
+            "max": max_val,
+            "range": range_val,
+            "ranges": ranges,
+            "unique_values": len(set(values))
+        }
+
+    temp_stats = analyze_param(temperatures, "temperature")
+    top_p_stats = analyze_param(top_ps, "top_p")
+    max_tokens_stats = analyze_param(max_tokens_list, "max_tokens")
+
+    # Create a rich table for the metrics
+    table = Table(title="🎯 Parameter Diversity Analysis", show_header=True, header_style="bold magenta")
+    table.add_column("Parameter", style="cyan", no_wrap=True)
+    table.add_column("Mean", style="green")
+    table.add_column("Median", style="green")
+    table.add_column("Std Dev", style="yellow")
+    table.add_column("CV %", style="yellow")
+    table.add_column("Range", style="red")
+    table.add_column("Unique Values", style="blue")
+    table.add_column("Distribution", style="magenta")
+
+    # Add rows for each parameter
+    def format_ranges(ranges):
+        return "\n".join([f"{k}: {v}" for k, v in ranges.items()])
+
+    table.add_row(
+        "Temperature",
+        str(temp_stats["mean"]),
+        str(temp_stats["median"]),
+        str(temp_stats["stdev"]),
+        str(temp_stats["cv_percent"]),
+        f"{temp_stats['min']}-{temp_stats['max']}",
+        str(temp_stats["unique_values"]),
+        format_ranges(temp_stats["ranges"])
+    )
+
+    table.add_row(
+        "Top-P",
+        str(top_p_stats["mean"]),
+        str(top_p_stats["median"]),
+        str(top_p_stats["stdev"]),
+        str(top_p_stats["cv_percent"]),
+        f"{top_p_stats['min']}-{top_p_stats['max']}",
+        str(top_p_stats["unique_values"]),
+        format_ranges(top_p_stats["ranges"])
+    )
+
+    table.add_row(
+        "Max Tokens",
+        str(max_tokens_stats["mean"]),
+        str(max_tokens_stats["median"]),
+        str(max_tokens_stats["stdev"]),
+        str(max_tokens_stats["cv_percent"]),
+        f"{max_tokens_stats['min']}-{max_tokens_stats['max']}",
+        str(max_tokens_stats["unique_values"]),
+        format_ranges(max_tokens_stats["ranges"])
+    )
+
+    # Calculate step-to-step variation
+    temp_changes = []
+    top_p_changes = []
+    max_tokens_changes = []
+
+    for i in range(1, len(param_history)):
+        temp_changes.append(abs(param_history[i]["temperature"] - param_history[i-1]["temperature"]))
+        top_p_changes.append(abs(param_history[i]["top_p"] - param_history[i-1]["top_p"]))
+        max_tokens_changes.append(abs(param_history[i]["max_tokens"] - param_history[i-1]["max_tokens"]))
+
+    if temp_changes:
+        avg_temp_change = statistics.mean(temp_changes)
+        avg_top_p_change = statistics.mean(top_p_changes)
+        avg_max_tokens_change = statistics.mean(max_tokens_changes)
+
+        variation_table = Table(title="📈 Step-to-Step Variation", show_header=True, header_style="bold cyan")
+        variation_table.add_column("Parameter", style="cyan")
+        variation_table.add_column("Avg Step Change", style="green")
+        variation_table.add_column("Max Step Change", style="red")
+
+        variation_table.add_row(
+            "Temperature",
+            f"{avg_temp_change:.3f}",
+            f"{max(temp_changes):.3f}"
+        )
+        variation_table.add_row(
+            "Top-P",
+            f"{avg_top_p_change:.3f}",
+            f"{max(top_p_changes):.3f}"
+        )
+        variation_table.add_row(
+            "Max Tokens",
+            f"{avg_max_tokens_change:.1f}",
+            f"{max(max_tokens_changes):.1f}"
+        )
+
+        return Panel(Group(table, variation_table), title="🔬 Parameter Diversity Metrics", border_style="blue")
+    else:
+        return Panel(table, title="🔬 Parameter Diversity Metrics", border_style="blue")
 
 def get_architect_response(context):
     response = client.chat.completions.create(
@@ -277,6 +434,7 @@ def main():
     dialog = []
     director_outputs = []  # Collect Director outputs for report
     debug_infos = []  # Collect detailed debug info per step
+    param_history = []  # Collect parameter values for analysis
 
     for step in range(n_steps):
         current_step = step + 1
@@ -310,6 +468,15 @@ def main():
         director_json = get_director_response(history, name, base_prompt, script, step + 1, n_steps)
         updated_prompt = director_json["updated_prompt"]
         params = director_json["params"]
+
+        # Collect params for analysis
+        param_history.append({
+            "step": step + 1,
+            "character": name,
+            "temperature": params.get("temperature", 0.7),
+            "top_p": params.get("top_p", 1.0),
+            "max_tokens": params.get("max_tokens", 150)
+        })
 
         # Collect Director output for report
         director_outputs.append({
@@ -403,6 +570,12 @@ def main():
             f.write(f"- **Director JSON:** {debug_info['director_json']}\n")
             f.write(f"- **Character Prompt:** {debug_info['character_prompt']}\n")
             f.write(f"- **Raw Response:** {debug_info['raw_response']}\n\n")
+
+    # Display parameter diversity metrics in debug mode
+    if args.debug and param_history:
+        console.print("\n" + "="*80)
+        console.print(analyze_param_diversity(param_history))
+        console.print("="*80 + "\n")
 
     console.print(f"\n[bold yellow]Report saved to: {report_path}[/bold yellow]")
 
