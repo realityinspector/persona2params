@@ -16,7 +16,7 @@ client = OpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-MODEL = "anthropic/claude-3.5-sonnet"  # Or any model available on OpenRouter
+MODEL = "openai/gpt-4o"  # Stricter adherence than Claude for roleplaying
 
 # Load prompts from prompts.json
 with open("prompts.json", "r") as f:
@@ -101,14 +101,18 @@ def get_director_response(history, character_name, character_prompt):
 def get_character_response(system_prompt, history, params):
     messages = [{"role": "system", "content": system_prompt + "\n" + PROMPTS["roleplayer_suffix"]}]
     messages.extend([{"role": "assistant" if i % 2 == 0 else "user", "content": msg} for i, msg in enumerate(history)])
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=params.get("temperature", 0.7),
-        top_p=params.get("top_p", 1.0),
-        max_tokens=params.get("max_tokens", 150),
-    )
-    return response.choices[0].message.content.strip()
+    for attempt in range(3):  # Retry up to 3 times
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=params.get("temperature", 0.7),
+            top_p=params.get("top_p", 1.0),
+            max_tokens=params.get("max_tokens", 150) + (attempt * 100),
+        )
+        content = response.choices[0].message.content.strip()
+        if content:
+            return content
+    return "..."  # Fallback ellipsis for silence
 
 def main():
     parser = argparse.ArgumentParser()
@@ -135,6 +139,7 @@ def main():
     history = [f"Setting: {setting}"]  # Initial history
     dialog = []
     director_outputs = []  # Collect Director outputs for report
+    debug_infos = []  # Collect detailed debug info per step
 
     for step in range(n_steps):
         char_idx = step % len(characters)
@@ -160,21 +165,26 @@ def main():
             print(f"Updated Prompt: {updated_prompt}")
             print(f"Params: {params}")
 
-        # Character response with retry logic for empty responses
+        # Character response with enhanced retry logic
         response = get_character_response(updated_prompt, history, params)
-        if not response.strip():
-            print(f"[DEBUG] Empty response from {name}, retrying with higher max_tokens...")
-            # Retry once with higher max_tokens
-            retry_params = params.copy()
-            retry_params["max_tokens"] = max(params.get("max_tokens", 150) + 50, 200)
-            response = get_character_response(updated_prompt, history, retry_params)
-            if not response.strip():
-                print(f"[DEBUG] Still empty response from {name}, using fallback...")
-                response = f"*silence*"
+
+        # Post-process response to strip actions and prefixes
+        import re
+        response = re.sub(r'\*.*?\*', '', response)  # Strip *actions*
+        response = re.sub(r'^.*?:', '', response).strip()  # Strip any "Name:" prefixes
 
         full_line = f"{name}: {response}"
         dialog.append(full_line)
         history.append(full_line)
+
+        # Collect detailed debug info for report
+        debug_infos.append({
+            "step": step + 1,
+            "character": name,
+            "director_json": {"updated_prompt": updated_prompt, "params": params},
+            "character_prompt": updated_prompt + '\n' + PROMPTS['roleplayer_suffix'],
+            "raw_response": response
+        })
 
         if args.debug:
             print(f"[DEBUG] Character Prompt: {updated_prompt + '\n' + PROMPTS['roleplayer_suffix']}")
@@ -205,6 +215,13 @@ def main():
             f.write(f"**Step {director_output['step']} - {director_output['character']}:**\n")
             f.write(f"- **Updated Prompt:** {director_output['updated_prompt']}\n")
             f.write(f"- **Params:** {director_output['params']}\n\n")
+
+        f.write("### Detailed Debug Info\n")
+        for debug_info in debug_infos:
+            f.write(f"**Step {debug_info['step']} - {debug_info['character']}:**\n")
+            f.write(f"- **Director JSON:** {debug_info['director_json']}\n")
+            f.write(f"- **Character Prompt:** {debug_info['character_prompt']}\n")
+            f.write(f"- **Raw Response:** {debug_info['raw_response']}\n\n")
 
     print(f"\nReport saved to: {report_path}")
 
