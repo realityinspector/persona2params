@@ -1,0 +1,3 @@
+# requirements.txt
+openai
+python-dotenv
