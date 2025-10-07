@@ -454,8 +454,9 @@ def main():
         lines = script_text.split('\n')
         current_act_steps = []
 
-        for i, line in enumerate(lines):
-            line = line.strip()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             if line.startswith('ACT ') and ('(Step' in line or '(Steps' in line):
                 # Extract step numbers from "ACT X (Steps 1-2)" or "ACT X (Step 3)"
                 import re
@@ -475,19 +476,24 @@ def main():
                 for step in current_act_steps:
                     casting_per_step[step] = []
 
-                # Check if CASTING is on the same line
-                if 'CASTING:' in line:
-                    casting_part = line.split('CASTING:')[1].strip()
-                    # Remove any trailing content after the casting (like . SCENE:)
-                    if 'SCENE:' in casting_part:
-                        casting_part = casting_part.split('SCENE:')[0].strip()
-                    elif '.' in casting_part:
-                        casting_part = casting_part.split('.')[0].strip()
-                    # Split by commas and clean up names
-                    cast_chars = [name.strip().rstrip('.') for name in casting_part.split(',') if name.strip()]
-                    # Add to all steps in current act
-                    for step in current_act_steps:
-                        casting_per_step[step] = cast_chars
+                # Look for CASTING in the next few lines
+                j = i + 1
+                while j < len(lines) and not lines[j].strip().startswith('ACT '):
+                    cast_line = lines[j].strip()
+                    if cast_line.startswith('CASTING:'):
+                        casting_part = cast_line.split('CASTING:')[1].strip()
+                        # Remove any trailing content after the casting
+                        if '.' in casting_part:
+                            casting_part = casting_part.split('.')[0].strip()
+                        # Split by commas and clean up names
+                        cast_chars = [name.strip() for name in casting_part.split(',') if name.strip()]
+                        # Add to all steps in current act
+                        for step in current_act_steps:
+                            casting_per_step[step] = cast_chars
+                        break
+                    j += 1
+
+            i += 1
 
         return casting_per_step
 
