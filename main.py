@@ -47,13 +47,17 @@ def get_architect_response(context):
 
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
             json_content = content[start_idx:end_idx + 1]
-            # Clean up control characters that might break JSON parsing
+            # Clean up characters that might break JSON parsing
             import re
+            # Remove control characters
             json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
+            # Escape single quotes within string values (but not structural quotes)
+            # This is a simple approach - replace single quotes with escaped versions
+            json_content = json_content.replace("'", "\\'")
             try:
                 return json.loads(json_content)
             except json.JSONDecodeError as e:
-                print(f"[DEBUG] Failed to parse extracted JSON from architect: {json_content}")
+                print(f"[DEBUG] Failed to parse extracted JSON from architect: {json_content[:500]}...")
                 raise e
         else:
             print(f"[DEBUG] No JSON found in architect response: {content}")
@@ -87,13 +91,16 @@ def get_scriptwriter_response(context, characters):
 
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
             json_content = content[start_idx:end_idx + 1]
-            # Clean up control characters that might break JSON parsing
+            # Clean up characters that might break JSON parsing
             import re
+            # Remove control characters
             json_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_content)
+            # Escape single quotes within string values
+            json_content = json_content.replace("'", "\\'")
             try:
                 return json.loads(json_content)
             except json.JSONDecodeError as e:
-                print(f"[DEBUG] Failed to parse extracted JSON from scriptwriter: {json_content}")
+                print(f"[DEBUG] Failed to parse extracted JSON from scriptwriter: {json_content[:500]}...")
                 raise e
         else:
             print(f"[DEBUG] No JSON found in scriptwriter response: {content}")
